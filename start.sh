@@ -235,5 +235,23 @@ if [ "$CPU_CACHE_GB" != "0" ]; then
     cmd+=(--cpu_cache_size "$CPU_CACHE_GB")
 fi
 
+# Thinking budget: a long <think> is force-closed so the answer still fits
+# in max_tokens. Defaults live in serve_openai.py; override via .env.
+if [ -n "${DEFAULT_MAX_TOKENS:-}" ]; then
+    cmd+=(--default_max_tokens "$DEFAULT_MAX_TOKENS")
+fi
+if [ -n "${REASONING_EFFORT:-}" ]; then
+    cmd+=(--reasoning_effort "$REASONING_EFFORT")
+fi
+if [ -n "${THINKING_BUDGET:-}" ]; then
+    cmd+=(--thinking_budget "$THINKING_BUDGET")
+fi
+if [ -n "${ANSWER_RESERVE:-}" ]; then
+    cmd+=(--answer_reserve "$ANSWER_RESERVE")
+fi
+if [ "${ENABLE_THINKING:-}" = "0" ] || [ "${ENABLE_THINKING:-}" = "false" ]; then
+    cmd+=(--no_thinking)
+fi
+
 echo "Starting: ${cmd[*]}"
 exec "${cmd[@]}"
