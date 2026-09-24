@@ -768,7 +768,18 @@ class SS_RepP(SS_Base):
         self.sustain_range = sustain_range
         self.decay_range = decay_range
 
+    def _off(self) -> bool:
+        # 1.0 is the transformers no-op. An explicit 0 is the client "turn this
+        # penalty off" value; the kernel divides by rep_p, so 0 would make every
+        # positive logit +inf.
+        return self.rep_p == 1.0 or self.rep_p == 0.0
+
     def run(self, state: SamplingState):
+        if self._off():
+            if state.state == SS.INIT:
+                state.logits = state.in_logits.to(torch.float, copy = True)
+            state.state = SS.LOGITS
+            return
         match state.state:
             case SS.INIT:
                 state.logits = torch.empty_like(state.in_logits, dtype = torch.float)
@@ -794,6 +805,8 @@ class SS_RepP(SS_Base):
         state.state = SS.LOGITS
 
     def alt(self):
+        # 1.0 drops out. Explicit 0 stays: run() copies the logits and must not
+        # call the kernel, which divides by rep_p.
         if self.rep_p == 1.0 or self.sustain_range + self.decay_range <= 0:
             return SS_NoOp()
         return None
@@ -865,6 +878,246 @@ class SS_PresFreqP(SS_Base):
 
     def reqs_past_ids(self):
         return True
+
+
+# llama.cpp FLOAT_MAX_LOG: ln of the largest float32. Caps DRY's exponent.
+_DRY_FLOAT_MAX_LOG = 88.7228391
+
+
+def _dry_max_exponent(base: float) -> int:
+    base_f = torch.tensor(base, dtype = torch.float)
+    if not (base_f > torch.tensor(1.000001, dtype = torch.float)).item():
+        return 0
+    return int(torch.tensor(_DRY_FLOAT_MAX_LOG, dtype = torch.float) / base_f.log())
+
+
+def dry_repeat_lengths(tokens: list[int], breakers: set[int] | None = None) -> dict[int, int]:
+    """Longest already-matched suffix each next token would extend.
+
+    Port of llama.cpp's DRY Z-scan (koboldcpp / pi6am). `tokens` is oldest to
+    newest. The returned length counts tokens already in the context, not the
+    candidate. A single-token breaker cuts the match off at the nearest breaker
+    to the end, and breaker token ids are omitted from the result.
+    """
+    n = len(tokens)
+    if n < 2:
+        return {}
+    rep_limit = n
+    if breakers:
+        for dist in range(n):
+            if tokens[n - 1 - dist] in breakers:
+                rep_limit = dist
+                break
+    if rep_limit <= 0:
+        return {}
+
+    repeat = [0] * n
+    last = n - 1
+    lt = 0
+    rt = 0
+
+    def rat(i: int) -> int:
+        return tokens[n - 1 - i]
+
+    for k in range(1, n):
+        if k > rt:
+            m = 0
+            while m + k < n and rat(m) == rat(m + k):
+                m += 1
+            repeat[last - k] = m if m < rep_limit else rep_limit
+            if m > 0:
+                lt = k
+                rt = k + m - 1
+        else:
+            p = k - lt
+            right_part_len = rt - k + 1
+            if repeat[last - p] < right_part_len:
+                prev = repeat[last - p]
+                repeat[last - k] = prev if prev < rep_limit else rep_limit
+            else:
+                i = rt + 1
+                while i < n and rat(i) == rat(i - k):
+                    i += 1
+                m = i - k
+                repeat[last - k] = m if m < rep_limit else rep_limit
+                lt = k
+                rt = i - 1
+
+    best: dict[int, int] = {}
+    for i in range(n - 1):
+        rl = repeat[i]
+        if rl <= 0:
+            continue
+        tok = rat(n - 2 - i)
+        if breakers and tok in breakers:
+            continue
+        if best.get(tok, 0) < rl:
+            best[tok] = rl
+    return best
+
+
+class SS_DRY(SS_Base):
+    """Penalize a token that would extend an already-repeated sequence.
+
+    Penalty is `multiplier * base ** (match_length - allowed_length)`, subtracted
+    from the logit. A match of length <= allowed_length is left alone, so short
+    repeats (method-call lists) stay writable. `dry_range` 0 scans the whole
+    context. `dry_sequence_breakers` is a set of token ids that reset the match;
+    None or an empty set means no breakers.
+    """
+
+    def __init__(
+        self,
+        dry_multiplier: float = 0.0,
+        dry_base: float = 1.75,
+        dry_allowed_length: int = 2,
+        dry_range: int = 0,
+        dry_sequence_breakers: set[int] | frozenset[int] | list[int] | None = None,
+    ):
+        self.dry_multiplier = float(dry_multiplier)
+        self.dry_base = float(dry_base)
+        self.dry_allowed_length = int(dry_allowed_length)
+        self.dry_range = int(dry_range)
+        self.max_exponent = _dry_max_exponent(self.dry_base)
+        if dry_sequence_breakers:
+            self.breakers = {int(t) for t in dry_sequence_breakers}
+        else:
+            self.breakers = None
+
+    def run(self, state: SamplingState):
+        match state.state:
+            case SS.INIT:
+                state.logits = state.in_logits.to(torch.float, copy = True)
+                state.state = SS.LOGITS
+            case SS.LOGITS:
+                pass
+            case _:
+                raise ValueError("Sampling logic error")
+        if self.dry_multiplier <= 0.0 or self.dry_base < 1.0 or state.past_ids is None:
+            return
+        past = state.past_ids
+        if past.dim() == 1:
+            past = past.unsqueeze(0)
+        for b in range(state.bsz):
+            row = past[b] if b < past.shape[0] else past[0]
+            if self.dry_range > 0 and row.shape[0] > self.dry_range:
+                row = row[-self.dry_range:]
+            tokens = row.detach().to(device = "cpu", dtype = torch.long).tolist()
+            matched = dry_repeat_lengths(tokens, self.breakers)
+            if not matched:
+                continue
+            ids = []
+            vals = []
+            for tok, rl in matched.items():
+                if rl <= self.dry_allowed_length or not (0 <= tok < state.dim):
+                    continue
+                exp = rl - self.dry_allowed_length
+                if self.max_exponent > 0 and exp > self.max_exponent:
+                    exp = self.max_exponent
+                ids.append(tok)
+                vals.append(self.dry_multiplier * (self.dry_base ** exp))
+            if not ids:
+                continue
+            idx = torch.tensor(ids, dtype = torch.long, device = state.logits.device)
+            pen = torch.tensor(vals, dtype = state.logits.dtype, device = state.logits.device)
+            state.logits[b, idx] -= pen
+
+    def alt(self):
+        if self.dry_multiplier <= 0.0 or self.dry_base < 1.0:
+            return SS_NoOp()
+        return None
+
+    def reqs_past_ids(self):
+        return True
+
+
+class SS_ThinkExit(SS_Base):
+    """Nudge a long open think trace toward </think> without ending the request.
+
+    After `budget` generated tokens with the close token still absent, that
+    token's logit rises linearly across `ramp` tokens up to `max_bias`. While
+    the think block is open, tokens repeated inside the last `think_freq_window`
+    generated tokens are penalized by `count * think_freq`. The close token is
+    not frequency-penalized, and both effects stop once </think> is in the
+    prompt or the generated tokens.
+    """
+
+    def __init__(
+        self,
+        close_id,
+        prompt_len,
+        budget,
+        ramp,
+        max_bias,
+        think_freq = 0.0,
+        think_freq_window = 256,
+    ):
+        self.close_id = int(close_id)
+        self.prompt_len = int(prompt_len)
+        self.budget = int(budget)
+        self.ramp = max(1, int(ramp))
+        self.max_bias = float(max_bias)
+        self.think_freq = float(think_freq)
+        self.think_freq_window = max(1, int(think_freq_window))
+
+    def reqs_past_ids(self):
+        return True
+
+    def _row(self, past_ids):
+        if past_ids is None or past_ids.numel() == 0:
+            return None
+        return past_ids[0] if past_ids.dim() == 2 else past_ids
+
+    def _bias(self, past_ids) -> float:
+        row = self._row(past_ids)
+        if row is None:
+            return 0.0
+        prompt_len = min(self.prompt_len, int(row.shape[0]))
+        if (row[:prompt_len] == self.close_id).any():
+            return 0.0
+        generated = row[prompt_len:]
+        if generated.numel() == 0 or (generated == self.close_id).any():
+            return 0.0
+        over = int(generated.shape[0]) - self.budget
+        if over <= 0:
+            return 0.0
+        return min(self.max_bias, over / self.ramp * self.max_bias)
+
+    def _open_generated(self, past_ids):
+        if self.think_freq <= 0:
+            return None
+        row = self._row(past_ids)
+        if row is None:
+            return None
+        prompt_len = min(self.prompt_len, int(row.shape[0]))
+        if (row[:prompt_len] == self.close_id).any():
+            return None
+        generated = row[prompt_len:]
+        if generated.numel() == 0 or (generated == self.close_id).any():
+            return None
+        return generated
+
+    def _penalize_open_think(self, state: SamplingState):
+        generated = self._open_generated(state.past_ids)
+        if generated is None or int(generated.shape[0]) < 16:
+            return
+        recent = generated[-self.think_freq_window:].to(torch.long)
+        counts = torch.bincount(recent.reshape(-1).cpu(), minlength = state.dim)
+        penalty = counts.to(device = state.logits.device, dtype = state.logits.dtype) * self.think_freq
+        if 0 <= self.close_id < penalty.shape[0]:
+            penalty[self.close_id] = 0
+        state.logits[0] -= penalty[:state.logits.shape[-1]]
+
+    def run(self, state: SamplingState):
+        if state.state == SS.INIT:
+            state.logits = state.in_logits.to(torch.float, copy = True)
+            state.state = SS.LOGITS
+        if state.state != SS.LOGITS or self.close_id >= state.dim:
+            return
+        bias = self._bias(state.past_ids)
+        if bias:
+            state.logits[..., self.close_id] += bias
+        self._penalize_open_think(state)
 
 
 class SS_AdaptiveP(SS_Base):
@@ -971,7 +1224,9 @@ class CustomSampler(Sampler):
         fused_tail = None
         if fused_sampler_enable:
             i = 0
-            while i < len(simplified) and type(simplified[i]) in (SS_RepP, SS_PresFreqP, SS_BanTokens, SS_LogitBias):
+            while i < len(simplified) and type(simplified[i]) in (
+                SS_RepP, SS_PresFreqP, SS_DRY, SS_ThinkExit, SS_BanTokens, SS_LogitBias,
+            ):
                 i += 1
             fused_tail = _match_fused_tail(simplified[i:])
             if fused_tail is not None:

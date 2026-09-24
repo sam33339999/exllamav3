@@ -216,12 +216,51 @@ if [ "$CONTEXT_SIZE" -gt 262144 ] \
     echo "CONTEXT_SIZE > 262k: switched $MODEL_DIR/config.json to the YaRN 1M variant."
 fi
 
+# KV allocation covers the advertised context plus the DFlash2 verify window
+# (3090 host serve used 270336 for a 262144 context).
+CACHE_TOKENS="${CACHE_TOKENS:-$(( CONTEXT_SIZE + 8192 ))}"
+# 3090 host-serve penalties. Client fields still override per request.
+# THINKING_BUDGET=0 keeps the effort table from force-closing </think>;
+# the think-exit logit bonus (THINK_BUDGET/THINK_RAMP) is what ends a long think.
+DRY_MULTIPLIER="${DRY_MULTIPLIER:-0.2}"
+DRY_BASE="${DRY_BASE:-1.75}"
+DRY_ALLOWED_LENGTH="${DRY_ALLOWED_LENGTH:-6}"
+DRY_RANGE="${DRY_RANGE:-4096}"
+REP_PENALTY="${REP_PENALTY:-1.0}"
+FREQ_PENALTY="${FREQ_PENALTY:-0}"
+FREQ_RANGE="${FREQ_RANGE:-512}"
+THINK_BUDGET="${THINK_BUDGET:-4096}"
+THINK_RAMP="${THINK_RAMP:-1536}"
+THINK_BIAS="${THINK_BIAS:-16}"
+THINK_FREQ="${THINK_FREQ:-0.2}"
+LOOP_WINDOW="${LOOP_WINDOW:-0}"
+LOOP_REPS="${LOOP_REPS:-3}"
+# 0 = no effort-sized hard inject. A positive value restores that inject.
+THINKING_BUDGET="${THINKING_BUDGET:-0}"
+DEFAULT_MAX_TOKENS="${DEFAULT_MAX_TOKENS:-32768}"
+
 cmd=("$PYTHON" -u tools/serve_openai.py
      --model "$MODEL_DIR"
      --host "$HOST"
      --port "$PORT"
-     --cache_size "$CONTEXT_SIZE"
-     --grid_size "$GPU_MEM_GB")
+     --cache_size "$CACHE_TOKENS"
+     --max_model_len "$CONTEXT_SIZE"
+     --grid_size "$GPU_MEM_GB"
+     --default_max_tokens "$DEFAULT_MAX_TOKENS"
+     --thinking_budget "$THINKING_BUDGET"
+     --dry_multiplier "$DRY_MULTIPLIER"
+     --dry_base "$DRY_BASE"
+     --dry_allowed_length "$DRY_ALLOWED_LENGTH"
+     --dry_range "$DRY_RANGE"
+     --rep_penalty "$REP_PENALTY"
+     --freq_penalty "$FREQ_PENALTY"
+     --freq_range "$FREQ_RANGE"
+     --think_budget "$THINK_BUDGET"
+     --think_ramp "$THINK_RAMP"
+     --think_bias "$THINK_BIAS"
+     --think_freq "$THINK_FREQ"
+     --loop_window "$LOOP_WINDOW"
+     --loop_reps "$LOOP_REPS")
 
 if [ "$CACHE_QUANT" != "none" ]; then
     cmd+=(--cache_quant "$CACHE_QUANT")
@@ -235,16 +274,10 @@ if [ "$CPU_CACHE_GB" != "0" ]; then
     cmd+=(--cpu_cache_size "$CPU_CACHE_GB")
 fi
 
-# Thinking budget: a long <think> is force-closed so the answer still fits
-# in max_tokens. Defaults live in serve_openai.py; override via .env.
-if [ -n "${DEFAULT_MAX_TOKENS:-}" ]; then
-    cmd+=(--default_max_tokens "$DEFAULT_MAX_TOKENS")
-fi
+# Template reasoning effort. The hard </think> inject is THINKING_BUDGET
+# above (default 0); this only changes the chat-template instruction.
 if [ -n "${REASONING_EFFORT:-}" ]; then
     cmd+=(--reasoning_effort "$REASONING_EFFORT")
-fi
-if [ -n "${THINKING_BUDGET:-}" ]; then
-    cmd+=(--thinking_budget "$THINKING_BUDGET")
 fi
 if [ -n "${ANSWER_RESERVE:-}" ]; then
     cmd+=(--answer_reserve "$ANSWER_RESERVE")
@@ -252,6 +285,12 @@ fi
 if [ "${ENABLE_THINKING:-}" = "0" ] || [ "${ENABLE_THINKING:-}" = "false" ]; then
     cmd+=(--no_thinking)
 fi
+
+# Faster than unset on this RTX 5090 laptop (64-token greedy: 151 vs 139 tok/s).
+export EXL3_HGEMM_F16ACC="${EXL3_HGEMM_F16ACC:-auto}"
+export EXL3_INT8_GEMV="${EXL3_INT8_GEMV:-2}"
+export EXL3_INT8_GEMV_MAX_K="${EXL3_INT8_GEMV_MAX_K:-5}"
+export EXL3_QC_STAGING="${EXL3_QC_STAGING:-1}"
 
 echo "Starting: ${cmd[*]}"
 exec "${cmd[@]}"
