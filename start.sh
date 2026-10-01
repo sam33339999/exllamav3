@@ -167,6 +167,21 @@ if [ -z "$DRAFT" ]; then
 fi
 DRAFT="$(echo "$DRAFT" | tr '[:upper:]' '[:lower:]')"
 
+# Speculative steps per verification round. Unset keeps the drafter
+# default (MTP: 4, DFlash2: block_size - 1). See .env.example.
+if [ -n "${NUM_DRAFT_TOKENS:-}" ]; then
+    case "$NUM_DRAFT_TOKENS" in
+        *[!0-9]*)
+            echo "NUM_DRAFT_TOKENS must be a positive integer (got: $NUM_DRAFT_TOKENS)" >&2
+            exit 1
+            ;;
+    esac
+    if [ "$((10#$NUM_DRAFT_TOKENS))" -lt 1 ]; then
+        echo "NUM_DRAFT_TOKENS must be >= 1 (got: $NUM_DRAFT_TOKENS). Use DRAFT=none to disable drafting." >&2
+        exit 1
+    fi
+fi
+
 # --- auto-download from the Hub if missing --------------------
 # Repos are private: put HF_TOKEN=<token> in .env, or `hf auth login`.
 HF_TARGET_REPO="${HF_TARGET_REPO:-Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw}"
@@ -270,6 +285,9 @@ case "$DRAFT" in
     dflash2)  cmd+=(--draft_model "$DRAFT_DIR") ;;
     none)     cmd+=(--draft_model none) ;;   # skip the server's built-in default draft path
 esac
+if [ -n "${NUM_DRAFT_TOKENS:-}" ] && [ "$DRAFT" != "none" ]; then
+    cmd+=(--num_draft_tokens "$NUM_DRAFT_TOKENS")
+fi
 if [ "$CPU_CACHE_GB" != "0" ]; then
     cmd+=(--cpu_cache_size "$CPU_CACHE_GB")
 fi

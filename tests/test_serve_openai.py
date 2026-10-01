@@ -137,6 +137,30 @@ class TestParseRequest(unittest.TestCase):
         self.assertEqual(req["max_tokens"], 333)
 
 
+class TestDraftModelArgv(unittest.TestCase):
+    def test_mtp_default_omits_step_count(self):
+        self.assertEqual(so.draft_model_argv("mtp"), ["-mtp"])
+
+    def test_mtp_steps_forward_ndt(self):
+        self.assertEqual(
+            so.draft_model_argv("mtp", 6),
+            ["-mtp", "-ndt", "6"],
+        )
+
+    def test_dflash_path_keeps_directory(self):
+        self.assertEqual(
+            so.draft_model_argv("models/draft", 3),
+            ["-dm", "models/draft", "-ndt", "3"],
+        )
+
+    def test_none_ignores_step_count(self):
+        self.assertEqual(so.draft_model_argv("none", 4), [])
+
+    def test_zero_steps_rejected(self):
+        with self.assertRaises(ValueError):
+            so.draft_model_argv("mtp", 0)
+
+
 class TestAsBool(unittest.TestCase):
     def test_common_falsey(self):
         for v in (False, "false", "False", "0", "off", "no"):

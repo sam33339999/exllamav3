@@ -5,7 +5,9 @@ Minimal OpenAI-compatible server for the EXL3 serving target.
 Drafter: MTP by default (`-dm mtp`; the draft head lives inside the target
 checkpoint). Alternatives: a DFlash2 draft model directory (`-dm <dir>`),
 or no drafting (`-dm none`). The start.sh launcher maps the .env `DRAFT`
-knob onto these.
+knob onto these. `--num_draft_tokens` (`.env` `NUM_DRAFT_TOKENS`) sets how
+many tokens are drafted before each verification. Omit it to keep the
+drafter default (MTP: 4, DFlash2: block_size - 1, 7 for this Qwen3.8 draft).
 
 Endpoints:
   GET  /v1/models
@@ -135,6 +137,29 @@ SERVER_DEFAULTS = {
 }
 
 
+def draft_model_argv(draft_model: str, num_draft_tokens: int | None = None) -> list[str]:
+    """model_init flags for the chosen drafter.
+
+    ``num_draft_tokens`` is the speculative window (MTP: one greedy forward
+    of the 1-token head per step). ``None`` leaves the architecture default
+    (Qwen3.5 MTP: 4, DFlash2: block_size - 1).
+    """
+    draft = (draft_model or "").lower()
+    use_mtp = draft == "mtp"
+    use_draft = draft not in ("none", "", "-")
+    argv: list[str] = []
+    if use_mtp:
+        argv += ["-mtp"]
+    elif use_draft:
+        argv += ["-dm", draft_model]
+    if num_draft_tokens is not None:
+        if int(num_draft_tokens) < 1:
+            raise ValueError("num_draft_tokens must be >= 1")
+        if use_draft:
+            argv += ["-ndt", str(int(num_draft_tokens))]
+    return argv
+
+
 def build_model(argv, use_draft = True):
     from argparse import ArgumentParser
 
@@ -160,12 +185,13 @@ def build_model(argv, use_draft = True):
     if use_draft:
         model, config, cache, tokenizer, draft_model, draft_config, draft_cache = \
             model_init.init(args, progress = True)
+        # None keeps default_draft_size (DFlash2: block_size - 1 = 7, MTP: 4).
+        # -ndt is also on argv so model_init sizes max_history for the window.
+        ndt = getattr(args, "num_draft_tokens", None)
         generator = Generator(
             model, cache, tokenizer,
             draft_model = draft_model, draft_cache = draft_cache,
-            # num_draft_tokens defaults to the draft model's arch-declared
-            # default_draft_size (DFlash2: block_size - 1 = 7, MTP: 4). Must
-            # match model_init's max_history sizing, which reads the same caps.
+            **({} if not ndt else {"num_draft_tokens": int(ndt)}),
         )
     else:
         model, config, cache, tokenizer = model_init.init(args, progress = True)
@@ -1150,6 +1176,12 @@ def main():
                     help = "Draft model path, 'mtp' for MTP drafting (head inside the "
                            "main checkpoint: no extra weights, much smaller KV footprint) "
                            "or 'none' to disable drafting")
+    ap.add_argument("--num_draft_tokens", type = int, default = None,
+                    help = "Speculative steps per verification round. Omit to use "
+                           "the drafter default (MTP: 4, DFlash2: block_size - 1). "
+                           "On MTP each step is one greedy forward of the 1-token "
+                           "head. On DFlash2 this truncates the fixed diffusion "
+                           "block and must not exceed that block.")
     ap.add_argument("-gs", "--grid_size", type = int, default = 110)
     ap.add_argument("-cs", "--cache_size", type = int, default = 65536,
                     help = "KV cache size in tokens (default 65536; 8192 default "
@@ -1209,10 +1241,13 @@ def main():
     use_draft = _draft not in ("none", "", "-")
     argv = ["-m", args.model,
             "-gs", str(args.grid_size), "-cs", str(args.cache_size)]
-    if use_mtp:
-        argv += ["-mtp"]
-    elif use_draft:
-        argv += ["-dm", args.draft_model]
+    try:
+        argv += draft_model_argv(
+            args.draft_model,
+            args.num_draft_tokens if use_draft else None,
+        )
+    except ValueError as exc:
+        ap.error(str(exc))
     if args.cache_quant:
         argv += ["-cq", args.cache_quant]
     if args.cpu_cache_size:
@@ -1223,6 +1258,8 @@ def main():
              (f" + draft {args.draft_model}" if use_draft else " (no draft)"))
           + " ...", flush = True)
     generator, tokenizer = build_model(argv, use_draft = use_draft)
+    if use_draft:
+        print(f" == draft window: {generator.num_draft_tokens} token(s)", flush = True)
     ctx = int(args.max_model_len or args.cache_size)
     stats["context_length"] = ctx
     SERVER_DEFAULTS["max_tokens"] = int(args.default_max_tokens)
