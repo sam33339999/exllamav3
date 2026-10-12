@@ -4,7 +4,7 @@
 
 這份紀錄放在引擎 repo 的 `doc/`，不放在權重目錄裡。權重目錄不會進 git。
 
-原始 BF16 沒有改過。量化工作在寫這份紀錄時還在跑（文字層大約第 54 層，共 64 層）。`EXL3-3.5bpw` 和 `DFlash2-EXL3-5.0bpw` 要等日誌出現 `=== MAIN DONE ===` 和 `=== DFLASH DONE ===` 之後才算完成，完成前不要拿來開服務。
+原始 BF16 沒有改過。量化已完成：主模型 `=== MAIN DONE ===` 於 2026-10-09 23:34，DFlash2 `=== DFLASH DONE ===` 於 23:38。日誌在 `/home/spark/exl3-work-coder390-3.5/quantize.log`。兩個輸出目錄各有一份 Hugging Face 用的 `README.md`。轉換時複製進來的 `SHA256SUMS` 對不上新分片，已刪掉。DFlash2 目錄裡原本那份描述 FP8 的 `manifest.json` 已換成這次 EXL3 的說明。
 
 ## 原始檔
 
