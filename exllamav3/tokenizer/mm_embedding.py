@@ -34,6 +34,8 @@ class MMEmbedding:
         deepstack_embeddings: list[torch.Tensor] | None = None,
         grid_thw: tuple | None = None,
         mrope_merge_size: int | None = None,
+        prompt_mrope_pos_ids: torch.Tensor | None = None,
+        rope_delta: int | None = None,
         imp: dict | None = None
     ):
         """
@@ -56,6 +58,8 @@ class MMEmbedding:
             self.text_alias = imp["text_alias"]
             self.grid_thw = imp["grid_thw"]
             self.mrope_merge_size = imp["mrope_merge_size"]
+            self.prompt_mrope_pos_ids = imp.get("prompt_mrope_pos_ids")
+            self.rope_delta = imp.get("rope_delta")
             self.embeddings = imp["embeddings"]
             self.deepstack_embeddings = imp["deepstack_embeddings"]
             self.token_string = None
@@ -77,9 +81,13 @@ class MMEmbedding:
         self.deepstack_embeddings = deepstack_embeddings
         self.text_alias = text_alias or f"<$EMB_{self.first_index}$>"
 
-        # MRoPE
+        # MRoPE. Qwen stores one grid per image. MiniCPM stores the whole prompt's
+        # (3, seq) canvas and the decode offset next to that single embedding.
         self.grid_thw = grid_thw
         self.mrope_merge_size = mrope_merge_size
+        self.prompt_mrope_pos_ids = None if prompt_mrope_pos_ids is None else \
+            prompt_mrope_pos_ids.detach().to(device = "cpu", dtype = torch.long).contiguous()
+        self.rope_delta = None if rope_delta is None else int(rope_delta)
 
         # not exported for TP
         r = torch.arange(self.first_index, self.first_index + self.mm_length, dtype = torch.long)
@@ -102,6 +110,10 @@ def send_embeddings(producer, ies: list[MMEmbedding]):
                 "text_alias": ie.text_alias,
                 "grid_thw": ie.grid_thw,
                 "mrope_merge_size": ie.mrope_merge_size,
+                "prompt_mrope_pos_ids": producer.send(
+                    ie.prompt_mrope_pos_ids, cache_id = id(ie.prompt_mrope_pos_ids)
+                ) if ie.prompt_mrope_pos_ids is not None else None,
+                "rope_delta": ie.rope_delta,
                 "embeddings": producer.send(ie.embeddings, cache_id = id(ie.embeddings)),
                 "deepstack_embeddings": [
                     producer.send(dse, cache_id = id(dse))
@@ -117,6 +129,8 @@ def recv_embeddings(consumer, recv) -> list[MMEmbedding]:
     result = []
     assert recv.get("method") == "list", "Consumer expected list"
     for imp in recv["data"]:
+        if imp.get("prompt_mrope_pos_ids") is not None:
+            imp["prompt_mrope_pos_ids"] = consumer.recv(imp["prompt_mrope_pos_ids"])
         imp["embeddings"] = consumer.recv(imp["embeddings"])
         imp["deepstack_embeddings"] = [
             consumer.recv(dse) for dse in imp["deepstack_embeddings"]

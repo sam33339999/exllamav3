@@ -1065,13 +1065,28 @@ class Job:
         # Prepare MRoPE embeddings
         if self.embeddings and generator.model.caps.get("mrope"):
             ids = self.sequences[0].sequence_ids.torch()
-            freqs, offset = generator.model.g_rope.get_mrope_freqs(
-                ids,
-                self.embeddings,
-                ids.shape[-1]  # + self.max_new_tokens
-            )
-            self.alt_rope_freqs = freqs
-            self.alt_rope_offset = offset - ids.shape[-1]
+            canvases = [
+                emb for emb in self.embeddings
+                if getattr(emb, "prompt_mrope_pos_ids", None) is not None
+            ]
+            if canvases:
+                if len(canvases) != 1:
+                    raise ValueError("Canvas MRoPE expects one embedding that carries the whole prompt")
+                canvas = canvases[0].prompt_mrope_pos_ids
+                if canvas.shape[-1] != ids.shape[-1]:
+                    raise ValueError(
+                        f"Canvas length {canvas.shape[-1]} does not match prompt length {ids.shape[-1]}"
+                    )
+                self.alt_rope_freqs = generator.model.g_rope.freqs_from_mrope_pos_ids(canvas)
+                self.alt_rope_offset = int(canvases[0].rope_delta)
+            else:
+                freqs, offset = generator.model.g_rope.get_mrope_freqs(
+                    ids,
+                    self.embeddings,
+                    ids.shape[-1]  # + self.max_new_tokens
+                )
+                self.alt_rope_freqs = freqs
+                self.alt_rope_offset = offset - ids.shape[-1]
         else:
             self.alt_rope_freqs = None
             self.alt_rope_offset = 0
