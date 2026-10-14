@@ -455,7 +455,26 @@ class RoPE:
         if merge_size is None: merge_size = 1
         next_pos_idx = ext.gen_mrope_pos_ids(mrope_pos_ids, ids, merge_size, spans, grids)
 
-        # Interleave frequencies
+        return self.freqs_from_mrope_pos_ids(mrope_pos_ids), next_pos_idx
+
+
+    def freqs_from_mrope_pos_ids(self, mrope_pos_ids: torch.Tensor) -> torch.Tensor:
+        """Interleave a finished ``(3, seq)`` MRoPE table the same way as ``get_mrope_freqs``.
+
+        ``mrope_pos_ids`` may also be ``(3, 1, seq)``. Rows are ``(T, H, W)``. The result is
+        indexed by token position during prefill. Decode does not use this table: equal T/H/W
+        plus ``alt_rope_offset`` is ordinary 1D RoPE.
+        """
+        if self.mrope_section is None:
+            raise ValueError("RoPE settings have no mrope_section")
+        if mrope_pos_ids.dim() == 3:
+            if mrope_pos_ids.shape[1] != 1:
+                raise ValueError(f"Expected a single sequence, got shape {tuple(mrope_pos_ids.shape)}")
+            mrope_pos_ids = mrope_pos_ids[:, 0, :]
+        if mrope_pos_ids.shape[0] != 3:
+            raise ValueError(f"MRoPE position ids must start with 3 rows, got {tuple(mrope_pos_ids.shape)}")
+
+        mrope_pos_ids = mrope_pos_ids.to(self.inv_freq.device)
         inv_freq_expanded = self.inv_freq[None, None, :, None].float().expand(3, 1, -1, 1)
         position_ids_expanded = mrope_pos_ids[:, None, None, :].float()
         freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(2, 3)
@@ -464,8 +483,7 @@ class RoPE:
             length = self.mrope_section[dim] * 3
             idx = slice(offset, length, 3)
             freqs_t[..., idx] = freqs[dim, ..., idx]
-
-        return freqs_t.contiguous(), next_pos_idx
+        return freqs_t.contiguous()
 
 
     def apply(
