@@ -216,12 +216,22 @@ if [ "$CONTEXT_SIZE" -gt 262144 ] \
     echo "CONTEXT_SIZE > 262k: switched $MODEL_DIR/config.json to the YaRN 1M variant."
 fi
 
+# Sequences decoded together. Also the recurrent-state slot count.
+# The KV pool (CONTEXT_SIZE) is shared; one reply only pins MAX_RQ_TOKENS
+# new tokens before it requeues. MAX_SEQS=1 restores the old serial server.
+MAX_SEQS="${MAX_SEQS:-4}"
+MAX_RQ_TOKENS="${MAX_RQ_TOKENS:-2048}"
+MAX_OUTPUT_TOKENS="${MAX_OUTPUT_TOKENS:-8192}"
+
 cmd=("$PYTHON" -u tools/serve_openai.py
      --model "$MODEL_DIR"
      --host "$HOST"
      --port "$PORT"
      --cache_size "$CONTEXT_SIZE"
-     --grid_size "$GPU_MEM_GB")
+     --grid_size "$GPU_MEM_GB"
+     --max_seqs "$MAX_SEQS"
+     --max_rq_tokens "$MAX_RQ_TOKENS"
+     --max_output_tokens "$MAX_OUTPUT_TOKENS")
 
 if [ "$CACHE_QUANT" != "none" ]; then
     cmd+=(--cache_quant "$CACHE_QUANT")

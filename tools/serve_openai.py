@@ -15,7 +15,10 @@ Endpoints:
 Defaults match the serving convention: temperature 0.6, top-k 20, top-p 0.95,
 thinking enabled (reasoning arrives inline in `<think>`), speculative
 drafting active (drafter chosen via -dm, see above).
-Concurrency: requests are serialized (batch-1 draft); concurrent callers queue.
+Concurrency: one AsyncGenerator batches up to --max_seqs requests. Each job
+holds only a --max_rq_tokens window of new cache pages, then requeues, so one
+long reply cannot reserve the whole KV pool. --max_seqs is also the recurrent
+slot count (required for hybrid models such as MiniCPM-V / Qwen3.5).
 
 Tool calling (Qwen3.8 XML format):
   - `tools` (OpenAI function specs) are rendered by the model's HF chat template
@@ -32,17 +35,24 @@ Tool calling (Qwen3.8 XML format):
 
 Launch (from repo root):
   .venv/bin/python tools/serve_openai.py \
-      -m models/Qwen3.8-27B-EXL3-3.5bpw -gs 22 -cs 262144 -cq nvfp4 --port 8888
+      -m models/Qwen3.8-27B-EXL3-3.5bpw -gs 22 -cs 262144 -cq nvfp4 \
+      --max_seqs 4 --port 8888
 """
-import argparse, json, os, re, sys, time, threading, uuid
+import argparse, asyncio, json, os, re, sys, time, threading, uuid
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from aiohttp import web
 
 MODEL_DIR = "test_models/Qwen3.8-27B-exl3-3.5bpw-wm"
 DRAFT_DIR = "mtp"   # default drafting method: MTP head (no external draft model)
 PORT = 8888
+# One recurrent checkpoint on Qwen3.5 / MiniCPM-V. Smaller values are rounded
+# up to that interval inside Job.prepare_for_queue.
+DEFAULT_MAX_RQ_TOKENS = 2048
+DEFAULT_MAX_SEQS = 4
+DEFAULT_MAX_CHUNK = 2048
+# Used when a request omits max_tokens. Overridden by MAX_OUTPUT_TOKENS / --max_output_tokens.
+DEFAULT_MAX_OUTPUT_TOKENS = 8192
 
-gen_lock = threading.Lock()          # serialize generation (batch-1 draft)
 stats_lock = threading.Lock()
 # Cumulative counters for sparkDash live tok/s (GET /health).
 stats = {
@@ -74,7 +84,9 @@ TOOL_CALL_CLOSE = "</tool_call>"
 HOLD_BACK = 16                       # marker-safe holdback for streamed text
 
 
-def build_model(argv, use_draft = True):
+def load_model(argv, use_draft = True):
+    """Load weights and the paged cache. The AsyncGenerator is created later,
+    inside the aiohttp loop (it starts a task in __init__)."""
     from argparse import ArgumentParser
 
     # The one-time JIT build of the CUDA extension can look like a hang;
@@ -92,24 +104,17 @@ def build_model(argv, use_draft = True):
     except Exception:
         pass
 
-    from exllamav3 import model_init, Generator
+    from exllamav3 import model_init
     parser = ArgumentParser()
     model_init.add_args(parser, add_draft_model_args = use_draft)
     args = parser.parse_args(argv)
     if use_draft:
         model, config, cache, tokenizer, draft_model, draft_config, draft_cache = \
             model_init.init(args, progress = True)
-        generator = Generator(
-            model, cache, tokenizer,
-            draft_model = draft_model, draft_cache = draft_cache,
-            # num_draft_tokens defaults to the draft model's arch-declared
-            # default_draft_size (DFlash2: block_size - 1 = 7, MTP: 4). Must
-            # match model_init's max_history sizing, which reads the same caps.
-        )
     else:
         model, config, cache, tokenizer = model_init.init(args, progress = True)
-        generator = Generator(model, cache, tokenizer)
-    return generator, tokenizer
+        draft_model = draft_cache = None
+    return model, cache, tokenizer, draft_model, draft_cache
 
 
 def normalize_messages(messages):
@@ -276,11 +281,8 @@ def tool_choice_directive(tool_choice, tools):
     return tools, None
 
 
-def generate_full(generator, tokenizer, messages, max_tokens, temperature,
-                  top_p, top_k, seed, tools, tool_choice = None, stop = None,
-                  on_text = None):
-    """Blocking generation; returns (text, tool_calls, finish, p_toks, o_toks,
-    reasoning, content)."""
+def render_prompt(tokenizer, messages, tools, tool_choice):
+    """Apply the chat template. Returns (input_ids, prompt_toks, schemas, forced)."""
     schemas = build_tool_schemas(tools)
     tools, directive = tool_choice_directive(tool_choice, tools)
     if directive:
@@ -296,61 +298,94 @@ def generate_full(generator, tokenizer, messages, max_tokens, temperature,
         messages, add_generation_prompt = True, enable_thinking = True,
         tools = tools)
     prompt_toks = int(input_ids.shape[-1])
+    forced = tool_choice not in (None, "auto", "none")
+    return input_ids, prompt_toks, schemas, forced
+
+
+def finish_from(reason, calls):
+    if calls:
+        return "tool_calls"
+    return {"max_new_tokens": "length", "eos": "stop",
+            "stop_condition": "stop", "banned": "content_filter"}.get(reason, "stop")
+
+
+async def _release_job(job):
+    """Cancel unless the iterator already finished. Idempotent after EOS,
+    and shielded so a client disconnect still frees the cache slot."""
+    if job is None or job.cancelled:
+        return
+    try:
+        await asyncio.shield(job.cancel())
+    except Exception:
+        pass
+
+
+async def consume_job(agen, input_ids, prompt_toks, max_tokens, temperature,
+                      top_p, top_k, seed, stop, eos_token_id, max_rq_tokens,
+                      on_text = None):
+    """Enqueue one job on the shared generator and read it to completion.
+    Other in-flight consume_job calls are batched by AsyncGenerator."""
     from exllamav3.generator.sampler.presets import ComboSampler
-    from exllamav3 import Job
-    forced_choice = tool_choice not in (None, "auto", "none")
-    reason = "max_new_tokens"
+    from exllamav3.generator.async_generator import AsyncJob
+    sampler = ComboSampler(temperature = temperature, top_k = top_k, top_p = top_p)
+    stop_conditions = ["<|im_end|>", eos_token_id] + (stop or [])
+    job = AsyncJob(
+        agen,
+        input_ids = input_ids,
+        max_new_tokens = max_tokens,
+        max_rq_tokens = max_rq_tokens,
+        stop_conditions = stop_conditions,
+        sampler = sampler,
+        seed = seed,
+    )
     text = ""
+    reason = "max_new_tokens"
+    prefill_seen = 0
+    try:
+        async for r in job:
+            if r.get("stage") == "prefill":
+                curr = int(r.get("curr_progress") or 0)
+                if curr > prefill_seen:
+                    _bump_stats(prompt = curr - prefill_seen)
+                    prefill_seen = curr
+            elif _result_new_tokens(r):
+                _bump_stats(completion = _result_new_tokens(r))
+            chunk = r.get("text", "")
+            if chunk:
+                text += chunk
+                if on_text is not None:
+                    await on_text(chunk)
+            if r.get("eos"):
+                reason = r.get("eos_reason", reason)
+        if prefill_seen < prompt_toks:
+            _bump_stats(prompt = prompt_toks - prefill_seen)
+    finally:
+        await _release_job(job)
+    seq = job.job.sequences[0]
+    out_toks = int(seq.sequence_ids.seq_len - prompt_toks)
+    return text, reason, out_toks
 
-    def run_once():
-        nonlocal text, reason
-        text = ""
-        reason = "max_new_tokens"
-        sampler = ComboSampler(temperature = temperature, top_k = top_k, top_p = top_p)
-        stop_conditions = ["<|im_end|>", tokenizer.eos_token_id] + (stop or [])
-        job = Job(input_ids = input_ids, max_new_tokens = max_tokens,
-                  stop_conditions = stop_conditions,
-                  sampler = sampler, seed = seed)
-        prefill_seen = 0
-        with gen_lock:
-            generator.enqueue(job)
-            while generator.num_remaining_jobs():
-                for r in generator.iterate():
-                    if r.get("stage") == "prefill":
-                        curr = int(r.get("curr_progress") or 0)
-                        if curr > prefill_seen:
-                            _bump_stats(prompt=curr - prefill_seen)
-                            prefill_seen = curr
-                    elif _result_new_tokens(r):
-                        _bump_stats(completion=_result_new_tokens(r))
-                    chunk = r.get("text", "")
-                    if chunk:
-                        text += chunk
-                        if on_text is not None:
-                            on_text(chunk)
-                    if r.get("eos"):
-                        reason = r.get("eos_reason", reason)
-            if prefill_seen < prompt_toks:
-                _bump_stats(prompt=prompt_toks - prefill_seen)
-        return job
 
-    job = run_once()
+async def generate_full(agen, tokenizer, messages, max_tokens, temperature,
+                        top_p, top_k, seed, tools, tool_choice = None, stop = None,
+                        on_text = None, max_rq_tokens = DEFAULT_MAX_RQ_TOKENS):
+    """One chat completion on the shared batch. Returns
+    (text, tool_calls, finish, p_toks, o_toks, reasoning, content)."""
+    input_ids, prompt_toks, schemas, forced = render_prompt(
+        tokenizer, messages, tools, tool_choice)
+    text, reason, out_toks = await consume_job(
+        agen, input_ids, prompt_toks, max_tokens, temperature, top_p, top_k,
+        seed, stop, tokenizer.eos_token_id, max_rq_tokens,
+        on_text = None if forced else on_text)
     # Forced tool_choice is a prompt nudge; at temperature > 0 the model can
     # occasionally skip the call. One greedy retry makes it deterministic.
-    if forced_choice and not parse_tool_calls(text, schemas)[1]:
-        temperature = 0.0
-        job = run_once()
-    seq = job.sequences[0]
-    out_toks = int(seq.sequence_ids.seq_len - prompt_toks)
+    if forced and not parse_tool_calls(text, schemas)[1]:
+        text, reason, out_toks = await consume_job(
+            agen, input_ids, prompt_toks, max_tokens, 0.0, top_p, top_k,
+            seed, stop, tokenizer.eos_token_id, max_rq_tokens, on_text = None)
     content, calls = parse_tool_calls(text, schemas)
-    if calls:
-        finish = "tool_calls"
-    else:
-        finish = {"max_new_tokens": "length", "eos": "stop",
-                  "stop_condition": "stop", "banned": "content_filter"}.get(
-                      reason, "stop")
     reasoning, content = split_reasoning(content)
-    return text, calls, finish, prompt_toks, out_toks, reasoning, content
+    return text, calls, finish_from(reason, calls), prompt_toks, out_toks, reasoning, content
 
 
 async def models(request):
@@ -364,23 +399,36 @@ async def models(request):
 
 
 async def health(request):
+    agen = request.app.get("agen")
+    active = pending = None
+    max_seqs = request.app.get("max_seqs")
+    if agen is not None:
+        gen = agen.generator
+        active = gen.num_active_jobs()
+        pending = gen.num_pending_jobs()
+        max_seqs = gen.max_batch_size
     with stats_lock:
-        return web.json_response({
-            "ok": True,
-            "busy": gen_lock.locked(),
+        body = {
+            "ok": agen is not None,
+            "busy": bool(active or pending),
             "backend": "exl3",
             "prompt_tokens_total": stats["prompt_tokens_total"],
             "completion_tokens_total": stats["completion_tokens_total"],
             "context_length": stats["context_length"],
-        })
+            "active_jobs": active,
+            "pending_jobs": pending,
+            "max_seqs": max_seqs,
+            "max_output_tokens": request.app.get("default_max_tokens"),
+        }
+    return web.json_response(body)
 
 
-def parse_request(body):
+def parse_request(body, default_max_tokens):
     messages = body.get("messages")
     if not messages or not isinstance(messages, list):
         return None, "`messages` (list) is required"
     max_tokens = int(body.get("max_tokens") or
-                     body.get("max_completion_tokens") or 1024)
+                     body.get("max_completion_tokens") or default_max_tokens)
     temperature = float(body.get("temperature", 0.6))
     top_p = float(body.get("top_p", 0.95))
     top_k = int(body.get("top_k", 20))
@@ -404,9 +452,19 @@ def parse_request(body):
     ), None
 
 
+def _cache_error(exc):
+    return web.json_response(
+        {"error": {"message": f"context/cache: {exc}", "type": "invalid_request_error"}},
+        status = 400)
+
+
 async def chat_completions(request):
     app = request.app
-    generator, tokenizer = app["generator"], app["tokenizer"]
+    agen, tokenizer = app.get("agen"), app["tokenizer"]
+    if agen is None:
+        return web.json_response(
+            {"error": {"message": "model is not ready", "type": "server_error"}},
+            status = 503)
     try:
         body = await request.json()
     except web.HTTPRequestEntityTooLarge:
@@ -420,21 +478,22 @@ async def chat_completions(request):
             status = 413)
     except Exception:
         return web.json_response({"error": {"message": "invalid JSON"}}, status = 400)
-    req, err = parse_request(body)
+    req, err = parse_request(body, request.app["default_max_tokens"])
     if err:
         return web.json_response({"error": {"message": err}}, status = 400)
 
-    import asyncio
+    gen_kwargs = dict(
+        agen = agen, tokenizer = tokenizer, messages = req["messages"],
+        max_tokens = req["max_tokens"], temperature = req["temperature"],
+        top_p = req["top_p"], top_k = req["top_k"], seed = req["seed"],
+        tools = req["tools"], tool_choice = req["tool_choice"], stop = req["stop"],
+        max_rq_tokens = app["max_rq_tokens"],
+    )
     if not req["stream"]:
         try:
-            text, calls, finish, ptoks, otoks, reasoning, content = await asyncio.to_thread(
-                generate_full, generator, tokenizer, req["messages"],
-                req["max_tokens"], req["temperature"], req["top_p"], req["top_k"],
-                req["seed"], req["tools"], req["tool_choice"], req["stop"])
+            text, calls, finish, ptoks, otoks, reasoning, content = await generate_full(**gen_kwargs)
         except AssertionError as e:
-            return web.json_response(
-                {"error": {"message": f"context/cache: {e}", "type": "invalid_request_error"}},
-                status = 400)
+            return _cache_error(e)
         msg = {"role": "assistant", "content": content or None}
         if reasoning:
             msg["reasoning_content"] = reasoning
@@ -457,120 +516,97 @@ async def chat_completions(request):
     cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     model_id = req["model_id"]
     req_schemas = build_tool_schemas(req["tools"])
+    forced_choice = req["tool_choice"] not in (None, "auto", "none")
 
-    async def run():
-        loop = asyncio.get_event_loop()
-        queue = asyncio.Queue()
+    async def send(delta, finish = None):
+        obj = {"id": cid, "object": "chat.completion.chunk",
+               "created": int(time.time()), "model": model_id,
+               "choices": [{"index": 0, "delta": delta,
+                            "finish_reason": finish}]}
+        await resp.write(f"data: {json.dumps(obj)}\n\n".encode())
 
-        def on_text(chunk):
-            loop.call_soon_threadsafe(queue.put_nowait, ("delta", chunk))
+    pending, calls_emitted = "", False
+    call_idx = [0]
+    in_think = [True]          # generation starts inside <think> (template)
+    THINK_CLOSE = "</think>"
 
-        forced_choice = req["tool_choice"] not in (None, "auto", "none")
+    async def send_call(c):
+        nonlocal calls_emitted
+        calls_emitted = True
+        await send({"tool_calls": [dict(c, index = call_idx[0])]})
+        call_idx[0] += 1
 
-        def worker():
-            try:
-                text, calls, finish, ptoks, otoks, reasoning, content = generate_full(
-                    generator, tokenizer, req["messages"], req["max_tokens"],
-                    req["temperature"], req["top_p"], req["top_k"],
-                    req["seed"], req["tools"], req["tool_choice"], req["stop"],
-                    on_text = None if forced_choice else on_text)
-                loop.call_soon_threadsafe(queue.put_nowait,
-                                          ("done", (calls, finish, reasoning, content)))
-            except Exception as e:
-                loop.call_soon_threadsafe(queue.put_nowait, ("error", str(e)))
-        loop.run_in_executor(None, worker)
-
-        async def send(delta, finish = None):
-            obj = {"id": cid, "object": "chat.completion.chunk",
-                   "created": int(time.time()), "model": model_id,
-                   "choices": [{"index": 0, "delta": delta,
-                                "finish_reason": finish}]}
-            await resp.write(f"data: {json.dumps(obj)}\n\n".encode())
-
-        pending, finish, calls_emitted = "", None, False
-        call_idx = [0]
-        in_think = [True]          # generation starts inside <think> (template)
-        THINK_CLOSE = "</think>"
-
-        async def send_call(c):
-            nonlocal calls_emitted
-            calls_emitted = True
-            await send({"tool_calls": [dict(c, index = call_idx[0])]})
-            call_idx[0] += 1
-
-        async def flush_pending(final = False):
-            """Emit everything parseable from pending; keep marker-safe tail."""
-            nonlocal pending
-            while True:
-                if in_think[0]:
-                    close = pending.find(THINK_CLOSE)
-                    if close >= 0:
-                        head, pending = pending[:close], pending[close + len(THINK_CLOSE):]
-                        if head.strip():
-                            await send({"reasoning_content": head.lstrip("\n")})
-                        in_think[0] = False
-                        continue
-                    cut = len(pending) if final else max(0, len(pending) - HOLD_BACK)
-                    piece = pending[:cut]
-                    if piece.strip():
-                        await send({"reasoning_content": piece})
-                    pending = pending[cut:]
-                    return
-                if TOOL_CALL_OPEN in pending:
-                    head, rest = pending.split(TOOL_CALL_OPEN, 1)
-                    if head.strip() or (final and head):
-                        await send({"content": head})
-                    if TOOL_CALL_CLOSE in rest:
-                        block, pending = rest.split(TOOL_CALL_CLOSE, 1)
-                        _, calls = parse_tool_calls(
-                            TOOL_CALL_OPEN + block + TOOL_CALL_CLOSE,
-                            req_schemas)
-                        for c in calls:
-                            await send_call(c)
-                        continue
-                    # unterminated call: final -> implicit close, else hold
-                    if final and "<function=" in rest:
-                        _, calls = parse_tool_calls(TOOL_CALL_OPEN + rest,
-                                                    req_schemas)
-                        for c in calls:
-                            await send_call(c)
-                        pending = ""
-                    else:
-                        pending = TOOL_CALL_OPEN + rest
-                    return
+    async def flush_pending(final = False):
+        """Emit everything parseable from pending; keep marker-safe tail."""
+        nonlocal pending
+        while True:
+            if in_think[0]:
+                close = pending.find(THINK_CLOSE)
+                if close >= 0:
+                    head, pending = pending[:close], pending[close + len(THINK_CLOSE):]
+                    if head.strip():
+                        await send({"reasoning_content": head.lstrip("\n")})
+                    in_think[0] = False
+                    continue
                 cut = len(pending) if final else max(0, len(pending) - HOLD_BACK)
-                await send({"content": pending[:cut]})
+                piece = pending[:cut]
+                if piece.strip():
+                    await send({"reasoning_content": piece})
                 pending = pending[cut:]
                 return
-
-        while True:
-            kind, payload = await queue.get()
-            if kind == "error":
-                await resp.write(
-                    f'data: {json.dumps({"error": {"message": payload}})}\n\n'.encode())
-                break
-            if kind == "delta":
-                pending += payload
-                await flush_pending()
-            elif kind == "done":
-                calls, finish, reasoning, content = payload
-                await flush_pending(final = True)
-                if forced_choice:
-                    # Buffered path (no deltas were streamed): emit the
-                    # authoritative complete result as deltas.
-                    if reasoning:
-                        await send({"reasoning_content": reasoning})
-                    if content:
-                        await send({"content": content})
-                if not calls_emitted and calls:
+            if TOOL_CALL_OPEN in pending:
+                head, rest = pending.split(TOOL_CALL_OPEN, 1)
+                if head.strip() or (final and head):
+                    await send({"content": head})
+                if TOOL_CALL_CLOSE in rest:
+                    block, pending = rest.split(TOOL_CALL_CLOSE, 1)
+                    _, calls = parse_tool_calls(
+                        TOOL_CALL_OPEN + block + TOOL_CALL_CLOSE,
+                        req_schemas)
                     for c in calls:
                         await send_call(c)
-                await send({}, finish = finish)
-                await resp.write(b"data: [DONE]\n\n")
-                break
-        await resp.write_eof()
+                    continue
+                # unterminated call: final -> implicit close, else hold
+                if final and "<function=" in rest:
+                    _, calls = parse_tool_calls(TOOL_CALL_OPEN + rest,
+                                                req_schemas)
+                    for c in calls:
+                        await send_call(c)
+                    pending = ""
+                else:
+                    pending = TOOL_CALL_OPEN + rest
+                return
+            cut = len(pending) if final else max(0, len(pending) - HOLD_BACK)
+            await send({"content": pending[:cut]})
+            pending = pending[cut:]
+            return
+
+    async def on_text(chunk):
+        nonlocal pending
+        pending += chunk
+        await flush_pending()
+
     try:
-        await run()
+        text, calls, finish, _ptoks, _otoks, reasoning, content = await generate_full(
+            **gen_kwargs, on_text = None if forced_choice else on_text)
+        await flush_pending(final = True)
+        if forced_choice:
+            # Buffered path (no deltas were streamed): emit the
+            # authoritative complete result as deltas.
+            if reasoning:
+                await send({"reasoning_content": reasoning})
+            if content:
+                await send({"content": content})
+        if not calls_emitted and calls:
+            for c in calls:
+                await send_call(c)
+        await send({}, finish = finish)
+        await resp.write(b"data: [DONE]\n\n")
+        await resp.write_eof()
+    except AssertionError as e:
+        await resp.write(
+            f'data: {json.dumps({"error": {"message": f"context/cache: {e}"}})}\n\n'.encode())
+        await resp.write_eof()
     except ConnectionResetError:
         pass
     return resp
@@ -600,12 +636,32 @@ def main():
                     help = "max request body size in MiB (aiohttp's built-in "
                            "default is 1 MiB, far too small for a full tool "
                            "set + a long transcript)")
+    ap.add_argument("--max_seqs", type = int, default = DEFAULT_MAX_SEQS,
+                    help = "Max sequences decoded together, and the recurrent-state "
+                           "slot count (default 4). The KV pool (-cs) is shared.")
+    ap.add_argument("--max_rq_tokens", type = int, default = DEFAULT_MAX_RQ_TOKENS,
+                    help = "New tokens a job may pin before it requeues and releases "
+                           "its cache window (default 2048, one hybrid checkpoint).")
+    ap.add_argument("--max_chunk_size", type = int, default = DEFAULT_MAX_CHUNK,
+                    help = "Max prefill tokens per generator step (default 2048).")
+    ap.add_argument("--max_output_tokens", type = int,
+                    default = int(os.environ.get("MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS)),
+                    help = "Completion cap when a request omits max_tokens "
+                           "(env MAX_OUTPUT_TOKENS, default 8192). "
+                           "A request that sets max_tokens still wins.")
     args = ap.parse_args()
+    if args.max_seqs < 1:
+        ap.error("--max_seqs must be >= 1")
+    if args.max_rq_tokens < 1:
+        ap.error("--max_rq_tokens must be >= 1")
+    if args.max_output_tokens < 1:
+        ap.error("--max_output_tokens must be >= 1")
     _draft = args.draft_model.lower()
     use_mtp = _draft == "mtp"
     use_draft = _draft not in ("none", "", "-")
     argv = ["-m", args.model,
-            "-gs", str(args.grid_size), "-cs", str(args.cache_size)]
+            "-gs", str(args.grid_size), "-cs", str(args.cache_size),
+            "-ambs", str(args.max_seqs)]
     if use_mtp:
         argv += ["-mtp"]
     elif use_draft:
@@ -618,15 +674,42 @@ def main():
     print(f" == loading {args.model}"
           + (" + MTP head" if use_mtp else
              (f" + draft {args.draft_model}" if use_draft else " (no draft)"))
+          + f", max_seqs {args.max_seqs}"
           + " ...", flush = True)
-    generator, tokenizer = build_model(argv, use_draft = use_draft)
+    model, cache, tokenizer, draft_model, draft_cache = load_model(argv, use_draft = use_draft)
     stats["context_length"] = int(args.cache_size)
     print(" == model ready; accepting requests", flush = True)
 
+    async def start_agen(app):
+        from exllamav3.generator.async_generator import AsyncGenerator
+        kwargs = dict(
+            max_chunk_size = args.max_chunk_size,
+            max_batch_size = cache.num_slots,
+        )
+        if draft_model is not None:
+            kwargs["draft_model"] = draft_model
+            kwargs["draft_cache"] = draft_cache
+        app["agen"] = AsyncGenerator(model, cache, tokenizer, **kwargs)
+        # Let the iteration task reach its wait before the first request, so a
+        # notify cannot land before the condition is being waited on.
+        await asyncio.sleep(0)
+        print(f" == batching up to {app['agen'].generator.max_batch_size} sequences, "
+              f"rq window {args.max_rq_tokens}, "
+              f"default max_tokens {args.max_output_tokens}", flush = True)
+
+    async def stop_agen(app):
+        agen = app.get("agen")
+        if agen is not None:
+            await agen.close()
+
     app = web.Application(client_max_size = args.max_body_mb * 1024 * 1024)
-    app["generator"] = generator
     app["tokenizer"] = tokenizer
     app["max_body_mb"] = args.max_body_mb
+    app["max_seqs"] = args.max_seqs
+    app["max_rq_tokens"] = args.max_rq_tokens
+    app["default_max_tokens"] = args.max_output_tokens
+    app.on_startup.append(start_agen)
+    app.on_cleanup.append(stop_agen)
     app.router.add_get("/v1/models", models)
     app.router.add_get("/health", health)
     app.router.add_post("/v1/chat/completions", chat_completions)

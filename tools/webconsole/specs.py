@@ -204,6 +204,8 @@ SPECS = [
               help="127.0.0.1 for local-only"),
             f("grid_size", "Grid size (-gs)", "int", default=110),
             f("cache_size", "KV cache tokens (-cs)", "int", default=65536),
+            f("max_seqs", "Max sequences (--max_seqs)", "int", default=4,
+              help="Decoded together. Also the recurrent-state slot count."),
             f("cache_quant", "KV cache quant (-cq)", "str",
               help="e.g. '8' or '8,4' (k_bits,v_bits)"),
             f("cpu_cache_size", "CPU cache GB (-ccs)", "float",

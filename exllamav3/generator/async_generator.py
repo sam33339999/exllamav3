@@ -65,11 +65,13 @@ class AsyncGenerator:
             job.put_result(self.error)
             return
 
-        # Track the AsyncJob before enqueueing the underlying Job so any immediate generator result has a queue to
-        # land in. The sync generator still owns scheduling and serial assignment.
+        # Enqueue first. prepare_for_queue rejects prompts that cannot fit the cache;
+        # registering only after that succeeds keeps a rejected job out of self.jobs
+        # (a leaked entry would make the iteration task spin, because it wakes on
+        # len(self.jobs) > 0). enqueue itself only appends to the pending list.
         assert job.job not in self.jobs
-        self.jobs[job.job] = job
         self.generator.enqueue(job.job)
+        self.jobs[job.job] = job
 
         # Condition.notify_all() must run while holding the condition lock, so schedule a tiny coroutine instead of
         # trying to notify directly from this synchronous method.

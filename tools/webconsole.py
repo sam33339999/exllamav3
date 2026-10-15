@@ -167,6 +167,8 @@ def build_job(spec, p):
             argv += ["-dm", p["draft_model"]]
         else:
             argv += ["-dm", "none"]
+        if p.get("max_seqs") not in (None, ""):
+            argv += ["--max_seqs", str(p["max_seqs"])]
         for src, flag in (("grid_size", "-gs"), ("cache_size", "-cs"),
                           ("cache_quant", "-cq"), ("cpu_cache_size", "-ccs")):
             if p.get(src) not in (None, ""):
