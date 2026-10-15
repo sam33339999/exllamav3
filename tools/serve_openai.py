@@ -341,6 +341,7 @@ async def consume_job(agen, input_ids, prompt_toks, max_tokens, temperature,
     text = ""
     reason = "max_new_tokens"
     prefill_seen = 0
+    timing = {"cached_tokens": 0, "time_prefill": 0.0}
     try:
         async for r in job:
             if r.get("stage") == "prefill":
@@ -357,13 +358,17 @@ async def consume_job(agen, input_ids, prompt_toks, max_tokens, temperature,
                     await on_text(chunk)
             if r.get("eos"):
                 reason = r.get("eos_reason", reason)
+                timing = {
+                    "cached_tokens": int(r.get("cached_tokens") or 0),
+                    "time_prefill": float(r.get("time_prefill") or 0.0),
+                }
         if prefill_seen < prompt_toks:
             _bump_stats(prompt = prompt_toks - prefill_seen)
     finally:
         await _release_job(job)
     seq = job.job.sequences[0]
     out_toks = int(seq.sequence_ids.seq_len - prompt_toks)
-    return text, reason, out_toks
+    return text, reason, out_toks, timing
 
 
 async def generate_full(agen, tokenizer, messages, max_tokens, temperature,
@@ -373,19 +378,20 @@ async def generate_full(agen, tokenizer, messages, max_tokens, temperature,
     (text, tool_calls, finish, p_toks, o_toks, reasoning, content)."""
     input_ids, prompt_toks, schemas, forced = render_prompt(
         tokenizer, messages, tools, tool_choice)
-    text, reason, out_toks = await consume_job(
+    text, reason, out_toks, timing = await consume_job(
         agen, input_ids, prompt_toks, max_tokens, temperature, top_p, top_k,
         seed, stop, tokenizer.eos_token_id, max_rq_tokens,
         on_text = None if forced else on_text)
     # Forced tool_choice is a prompt nudge; at temperature > 0 the model can
     # occasionally skip the call. One greedy retry makes it deterministic.
     if forced and not parse_tool_calls(text, schemas)[1]:
-        text, reason, out_toks = await consume_job(
+        text, reason, out_toks, timing = await consume_job(
             agen, input_ids, prompt_toks, max_tokens, 0.0, top_p, top_k,
             seed, stop, tokenizer.eos_token_id, max_rq_tokens, on_text = None)
     content, calls = parse_tool_calls(text, schemas)
     reasoning, content = split_reasoning(content)
-    return text, calls, finish_from(reason, calls), prompt_toks, out_toks, reasoning, content
+    return (text, calls, finish_from(reason, calls), prompt_toks, out_toks,
+            reasoning, content, timing)
 
 
 async def models(request):
@@ -402,11 +408,20 @@ async def health(request):
     agen = request.app.get("agen")
     active = pending = None
     max_seqs = request.app.get("max_seqs")
+    cache_info = None
     if agen is not None:
         gen = agen.generator
         active = gen.num_active_jobs()
         pending = gen.num_pending_jobs()
         max_seqs = gen.max_batch_size
+        pt = gen.pagetable
+        cache_info = {
+            "pages": pt.max_pages,
+            "page_size": 256,
+            "referenced_pages": len(pt.referenced_pages),
+            "unreferenced_pages": pt.num_unreferenced_pages(),
+            **{k: int(v) for k, v in pt.metrics.items()},
+        }
     with stats_lock:
         body = {
             "ok": agen is not None,
@@ -419,6 +434,7 @@ async def health(request):
             "pending_jobs": pending,
             "max_seqs": max_seqs,
             "max_output_tokens": request.app.get("default_max_tokens"),
+            "cache": cache_info,
         }
     return web.json_response(body)
 
@@ -491,7 +507,7 @@ async def chat_completions(request):
     )
     if not req["stream"]:
         try:
-            text, calls, finish, ptoks, otoks, reasoning, content = await generate_full(**gen_kwargs)
+            text, calls, finish, ptoks, otoks, reasoning, content, timing = await generate_full(**gen_kwargs)
         except AssertionError as e:
             return _cache_error(e)
         msg = {"role": "assistant", "content": content or None}
@@ -505,7 +521,9 @@ async def chat_completions(request):
             "model": req["model_id"],
             "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
             "usage": {"prompt_tokens": ptoks, "completion_tokens": otoks,
-                      "total_tokens": ptoks + otoks},
+                      "total_tokens": ptoks + otoks,
+                      "cached_tokens": timing["cached_tokens"],
+                      "time_prefill": round(timing["time_prefill"], 4)},
         })
 
     # ---- streaming (SSE) ----
@@ -587,7 +605,7 @@ async def chat_completions(request):
         await flush_pending()
 
     try:
-        text, calls, finish, _ptoks, _otoks, reasoning, content = await generate_full(
+        text, calls, finish, _ptoks, _otoks, reasoning, content, _timing = await generate_full(
             **gen_kwargs, on_text = None if forced_choice else on_text)
         await flush_pending(final = True)
         if forced_choice:
