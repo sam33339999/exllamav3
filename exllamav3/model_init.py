@@ -3,10 +3,115 @@ from types import SimpleNamespace
 from . import Model, Config, Cache, Tokenizer
 from .loader import SafetensorsCollection, VariantSafetensorsCollection
 from .cache import CacheLayer_fp16, CacheLayer_quant, CacheLayer_fp8, CacheLayer_nvfp4
+from .cache.budget import (
+    GIB,
+    cache_bytes_per_token,
+    kv_pool_tokens,
+    safetensors_bytes,
+)
+from .constants import PAGE_SIZE
 from .generator.sampler import ComboSampler
-from argparse import ArgumentParser
+from argparse import ArgumentParser, ArgumentTypeError
+import os
 import yaml
 from pathlib import Path
+
+def _cache_size_arg(value):
+    text = str(value).strip().lower()
+    if text == "auto":
+        return "auto"
+    try:
+        n = int(text, 10)
+    except ValueError as exc:
+        raise ArgumentTypeError("cache_size must be a positive integer or 'auto'") from exc
+    if n < 1:
+        raise ArgumentTypeError("cache_size must be a positive integer or 'auto'")
+    return n
+
+
+def _select_cache_layer(args):
+    """Target cache class. Draft caches follow the same bits only for int quant."""
+    quant = getattr(args, "cache_quant", None)
+    if quant == "fp8":
+        return CacheLayer_fp8, {}, CacheLayer_fp16, {}
+    if quant == "nvfp4":
+        return CacheLayer_nvfp4, {}, CacheLayer_fp16, {}
+    if quant is not None:
+        split = [int(bits) for bits in quant.split(",")]
+        if len(split) == 1:
+            k_bits = v_bits = split[0]
+        elif len(split) == 2:
+            k_bits, v_bits = tuple(split)
+        else:
+            raise ValueError("Specify either one or two bitrates for cache quantization")
+        kw = dict(k_bits = k_bits, v_bits = v_bits, compand_a = args.cache_compand_a)
+        return CacheLayer_quant, kw, CacheLayer_quant, dict(k_bits = k_bits, v_bits = v_bits)
+    return CacheLayer_fp16, {}, CacheLayer_fp16, {}
+
+
+def _build_cache(model, num_tokens, layer_type, layer_kwargs, max_history, max_batch_size):
+    return Cache(
+        model,
+        max_num_tokens = num_tokens,
+        layer_type = layer_type,
+        max_history = max_history,
+        max_batch_size = max_batch_size,
+        **layer_kwargs,
+    )
+
+
+def _resolve_auto_cache_tokens(args, model, draft_model, layer_type, layer_kwargs,
+                               draft_layer_type, draft_layer_kwargs, max_history, quiet):
+    import torch
+    if not torch.cuda.is_available():
+        raise RuntimeError("--cache_size auto needs a CUDA device to read free memory")
+    probe = _build_cache(
+        model, PAGE_SIZE, layer_type, layer_kwargs, max_history, args.autosplit_max_batch_size,
+    )
+    try:
+        per_token = cache_bytes_per_token(probe)
+    finally:
+        probe.detach_from_model()
+    if draft_model is not None:
+        draft_probe = _build_cache(
+            draft_model, PAGE_SIZE, draft_layer_type, draft_layer_kwargs,
+            max_history, args.autosplit_max_batch_size,
+        )
+        try:
+            per_token += cache_bytes_per_token(draft_probe)
+        finally:
+            draft_probe.detach_from_model()
+    weight_bytes = safetensors_bytes(args.model_dir)
+    draft_dir = getattr(args, "draft_model_dir", None)
+    if draft_dir and Path(draft_dir).resolve() != Path(args.model_dir).resolve():
+        weight_bytes += safetensors_bytes(draft_dir)
+    free_bytes, total_bytes = torch.cuda.mem_get_info()
+    tokens = kv_pool_tokens(
+        free_bytes = int(free_bytes),
+        weight_bytes = weight_bytes,
+        bytes_per_token = per_token,
+        util = args.kv_util,
+        reserve_gb = args.kv_reserve_gb,
+        max_gb = args.kv_max_gb,
+        scratch_gb = args.kv_scratch_gb,
+    )
+    leave = max(args.kv_reserve_gb * GIB, int(free_bytes) * (1.0 - args.kv_util))
+    budget = min(
+        int(free_bytes) - weight_bytes - args.kv_scratch_gb * GIB - leave,
+        args.kv_max_gb * GIB,
+    )
+    if not quiet:
+        print(
+            f" == KV pool auto: free {int(free_bytes) / GIB:.2f} GiB, "
+            f"total {int(total_bytes) / GIB:.2f} GiB, "
+            f"weights {weight_bytes / GIB:.2f} GiB, "
+            f"leave {leave / GIB:.2f} GiB, "
+            f"budget {budget / GIB:.2f} GiB -> {tokens} tokens "
+            f"({tokens * per_token / GIB:.2f} GiB at {per_token:.0f} B/token)",
+            flush = True,
+        )
+    return tokens
+
 
 def add_args(
     parser: ArgumentParser,
@@ -99,7 +204,11 @@ def add_args(
         parser.add_argument("-adaptive_decay", "--adaptive_decay", type = float, help = f"Adaptive-P decay, if Adaptive-P enabled (default: {d.adaptive_decay:.2f})", default = d.adaptive_decay)
 
     if cache:
-        parser.add_argument("-cs", "--cache_size", type = int, help = f"Total cache size in tokens, default: {default_cache_size}", default = default_cache_size)
+        parser.add_argument("-cs", "--cache_size", type = _cache_size_arg, help = f"Total cache size in tokens, or 'auto' to size a reserved pool from free memory. Default: {default_cache_size}", default = default_cache_size)
+        parser.add_argument("--kv_util", type = float, default = float(os.environ.get("KV_UTIL", "0.85")), help = "With --cache_size auto, fraction of free memory the pool may use (default 0.85)")
+        parser.add_argument("--kv_reserve_gb", type = float, default = float(os.environ.get("KV_RESERVE_GB", "16")), help = "With --cache_size auto, GiB left untouched (default 16)")
+        parser.add_argument("--kv_max_gb", type = float, default = float(os.environ.get("KV_MAX_GB", "48")), help = "With --cache_size auto, hard cap on the pool in GiB (default 48)")
+        parser.add_argument("--kv_scratch_gb", type = float, default = float(os.environ.get("KV_SCRATCH_GB", "4")), help = "With --cache_size auto, GiB set aside for loader scratch (default 4)")
         parser.add_argument("-cq", "--cache_quant", type = str, help = "Use quantized cache. Specify either kv_bits or k_bits,v_bits pair")
         parser.add_argument("-cca", "--cache_compand_a", type = float, help = "Compand a value for simulated cache, default: 0.0", default = 0.0)
         parser.add_argument("-ccs", "--cpu_cache_size", type = float, help = f"CPU second-tier cache size, in GB, default: {default_cpu_cache_size}", default = default_cpu_cache_size)
@@ -260,76 +369,24 @@ def init(
         4 if (vars(args).get("ngram_match_min") and not vars(args).get("num_draft_tokens")) else 0,
     )
     if "cache_size" in vars(args):
-        if args.cache_quant == "fp8":
-            # NVFP4-recipe KV: raw FP8 E4M3, online dequant in the Triton paged kernels.
-            # Target only; the draft cache stays fp16 (its semantics are parity-pinned)
-            cache = Cache(
-                model,
-                max_num_tokens = args.cache_size,
-                layer_type = CacheLayer_fp8,
-                max_history = max_history,
-                max_batch_size = args.autosplit_max_batch_size,
+        layer_type, layer_kwargs, draft_layer_type, draft_layer_kwargs = _select_cache_layer(args)
+        if getattr(args, "cache_size", None) == "auto":
+            num_tokens = _resolve_auto_cache_tokens(
+                args, model, draft_model, layer_type, layer_kwargs,
+                draft_layer_type, draft_layer_kwargs, max_history, quiet,
             )
-            draft_cache = Cache(
-                draft_model,
-                max_num_tokens = args.cache_size,
-                max_history = max_history,
-            ) if draft_model_dir else None
-        elif args.cache_quant == "nvfp4":
-            # KV in the NVFP4 format itself: E2M1 + E4M3 block-16 scales (4.5 bits/elem).
-            # Target only; the draft cache stays fp16 (its semantics are parity-pinned)
-            cache = Cache(
-                model,
-                max_num_tokens = args.cache_size,
-                layer_type = CacheLayer_nvfp4,
-                max_history = max_history,
-                max_batch_size = args.autosplit_max_batch_size,
-            )
-            draft_cache = Cache(
-                draft_model,
-                max_num_tokens = args.cache_size,
-                max_history = max_history,
-            ) if draft_model_dir else None
-        elif args.cache_quant is not None:
-            split = [int(bits) for bits in args.cache_quant.split(",")]
-            if len(split) == 1:
-                k_bits = v_bits = split[0]
-            elif len(split) == 2:
-                k_bits, v_bits = tuple(split)
-            else:
-                raise ValueError("Specify either one or two bitrates for cache quantization")
-            cache = Cache(
-                model,
-                max_num_tokens = args.cache_size,
-                layer_type = CacheLayer_quant,
-                k_bits = k_bits,
-                v_bits = v_bits,
-                compand_a = args.cache_compand_a,
-                max_history = max_history,
-                max_batch_size = args.autosplit_max_batch_size,
-            )
-            draft_cache = Cache(
-                draft_model,
-                max_num_tokens = args.cache_size,
-                layer_type = CacheLayer_quant,
-                k_bits = k_bits,
-                v_bits = v_bits,
-                max_history = max_history,
-            ) if draft_model_dir else None
         else:
-            cache = Cache(
-                model,
-                max_num_tokens = args.cache_size,
-                layer_type = CacheLayer_fp16,
-                max_history = max_history,
-                max_batch_size = args.autosplit_max_batch_size,
-            )
-            draft_cache = Cache(
-                draft_model,
-                max_num_tokens = args.cache_size,
-                layer_type = CacheLayer_fp16,
-                max_history = max_history,
-            ) if draft_model_dir else None
+            num_tokens = int(args.cache_size)
+        # fp8/nvfp4 stay on the target only. Int quant uses the same bits on
+        # the draft cache, matching the previous branches.
+        cache = _build_cache(
+            model, num_tokens, layer_type, layer_kwargs,
+            max_history, args.autosplit_max_batch_size,
+        )
+        draft_cache = _build_cache(
+            draft_model, num_tokens, draft_layer_type, draft_layer_kwargs,
+            max_history, args.autosplit_max_batch_size,
+        ) if draft_model_dir else None
     else:
         cache = None
         draft_cache = None

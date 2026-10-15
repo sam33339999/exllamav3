@@ -621,9 +621,18 @@ def main():
                            "main checkpoint: no extra weights, much smaller KV footprint) "
                            "or 'none' to disable drafting")
     ap.add_argument("-gs", "--grid_size", type = int, default = 110)
-    ap.add_argument("-cs", "--cache_size", type = int, default = 65536,
-                    help = "KV cache size in tokens (default 65536; 8192 default "
-                           "of model_init is too small for large tool sets)")
+    ap.add_argument("-cs", "--cache_size", type = str,
+                    default = os.environ.get("CONTEXT_SIZE", "65536"),
+                    help = "KV cache size in tokens, or 'auto' to reserve a pool "
+                           "from free memory (default 65536, env CONTEXT_SIZE)")
+    ap.add_argument("--kv_util", type = float,
+                    default = float(os.environ.get("KV_UTIL", "0.85")))
+    ap.add_argument("--kv_reserve_gb", type = float,
+                    default = float(os.environ.get("KV_RESERVE_GB", "16")))
+    ap.add_argument("--kv_max_gb", type = float,
+                    default = float(os.environ.get("KV_MAX_GB", "48")))
+    ap.add_argument("--kv_scratch_gb", type = float,
+                    default = float(os.environ.get("KV_SCRATCH_GB", "4")))
     ap.add_argument("-cq", "--cache_quant", type = str, default = None,
                     help = "Quantized KV cache bits, e.g. 8 or 8,4 (k_bits[,v_bits])")
     ap.add_argument("-p", "--port", type = int, default = PORT)
@@ -661,7 +670,11 @@ def main():
     use_draft = _draft not in ("none", "", "-")
     argv = ["-m", args.model,
             "-gs", str(args.grid_size), "-cs", str(args.cache_size),
-            "-ambs", str(args.max_seqs)]
+            "-ambs", str(args.max_seqs),
+            "--kv_util", str(args.kv_util),
+            "--kv_reserve_gb", str(args.kv_reserve_gb),
+            "--kv_max_gb", str(args.kv_max_gb),
+            "--kv_scratch_gb", str(args.kv_scratch_gb)]
     if use_mtp:
         argv += ["-mtp"]
     elif use_draft:
@@ -677,7 +690,7 @@ def main():
           + f", max_seqs {args.max_seqs}"
           + " ...", flush = True)
     model, cache, tokenizer, draft_model, draft_cache = load_model(argv, use_draft = use_draft)
-    stats["context_length"] = int(args.cache_size)
+    stats["context_length"] = int(cache.max_num_tokens)
     print(" == model ready; accepting requests", flush = True)
 
     async def start_agen(app):

@@ -209,7 +209,8 @@ case "$DRAFT" in
 esac
 
 # Context beyond the native 262144 needs the YaRN config variant.
-if [ "$CONTEXT_SIZE" -gt 262144 ] \
+# CONTEXT_SIZE=auto sizes the pool at startup; it does not select YaRN.
+if [ "$CONTEXT_SIZE" != "auto" ] && [ "$CONTEXT_SIZE" -gt 262144 ] \
    && [ -f "$MODEL_DIR/config.yarn-1m.json" ] \
    && ! grep -q rope_scaling "$MODEL_DIR/config.json"; then
     cp "$MODEL_DIR/config.yarn-1m.json" "$MODEL_DIR/config.json"
@@ -222,6 +223,10 @@ fi
 MAX_SEQS="${MAX_SEQS:-4}"
 MAX_RQ_TOKENS="${MAX_RQ_TOKENS:-2048}"
 MAX_OUTPUT_TOKENS="${MAX_OUTPUT_TOKENS:-8192}"
+KV_UTIL="${KV_UTIL:-0.85}"
+KV_RESERVE_GB="${KV_RESERVE_GB:-16}"
+KV_MAX_GB="${KV_MAX_GB:-48}"
+KV_SCRATCH_GB="${KV_SCRATCH_GB:-4}"
 
 cmd=("$PYTHON" -u tools/serve_openai.py
      --model "$MODEL_DIR"
@@ -231,7 +236,11 @@ cmd=("$PYTHON" -u tools/serve_openai.py
      --grid_size "$GPU_MEM_GB"
      --max_seqs "$MAX_SEQS"
      --max_rq_tokens "$MAX_RQ_TOKENS"
-     --max_output_tokens "$MAX_OUTPUT_TOKENS")
+     --max_output_tokens "$MAX_OUTPUT_TOKENS"
+     --kv_util "$KV_UTIL"
+     --kv_reserve_gb "$KV_RESERVE_GB"
+     --kv_max_gb "$KV_MAX_GB"
+     --kv_scratch_gb "$KV_SCRATCH_GB")
 
 if [ "$CACHE_QUANT" != "none" ]; then
     cmd+=(--cache_quant "$CACHE_QUANT")

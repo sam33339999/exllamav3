@@ -15,8 +15,9 @@ on DGX Spark (GB10, aarch64) and 24 GB GPUs.
 - **aarch64 / GB10 (sm_120 / sm_121) support**: builds and runs from source on
   DGX Spark (no prebuilt wheels exist upstream).
 - **`tools/serve_openai.py`** — OpenAI-compatible server: chat completions
-  (stream + non-stream), Qwen tool calling with typed arguments, batch-1
-  speculative decode.
+  (stream + non-stream), Qwen tool calling with typed arguments, concurrent
+  batching (`--max_seqs`) and an optional reserved KV pool (`--cache_size auto`).
+  操作說明（繁體中文）：[`doc/serve-zhtw.md`](doc/serve-zhtw.md)。
 - **`tools/webconsole.py`** — web UI over the CLI: quantize, serve, chat
   playground, eval harnesses, job registry with live logs.
 - **`start.sh` / `stop.sh`** — self-bootstrapping launcher: venv, GPU torch,
