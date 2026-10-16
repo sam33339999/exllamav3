@@ -77,6 +77,25 @@ def safetensors_bytes(model_dir: str | Path) -> int:
     return sum(p.stat().st_size for p in files)
 
 
+def language_max_position(config) -> int | None:
+    """Token limit of the language model.
+
+    Vision wrappers often leave the outer ``max_position_embeddings`` at the
+    8192 default while the real limit lives under ``text_config``.
+    """
+    if config is None:
+        return None
+    raw = getattr(config, "config_dict", None)
+    if isinstance(raw, dict):
+        text = raw.get("text_config")
+        if isinstance(text, dict) and text.get("max_position_embeddings"):
+            return int(text["max_position_embeddings"])
+    outer = getattr(config, "max_position_embeddings", None)
+    if outer:
+        return int(outer)
+    return None
+
+
 def prompt_too_long(num_tokens: int, max_position_embeddings: int | None) -> str | None:
     """Error text when a prompt walks past the model's position table."""
     if not max_position_embeddings or max_position_embeddings <= 0:

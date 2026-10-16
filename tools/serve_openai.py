@@ -39,6 +39,7 @@ Launch (from repo root):
       --max_seqs 4 --port 8888
 """
 import argparse, asyncio, json, os, re, sys, time, threading, uuid
+from collections import deque
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from aiohttp import web
 
@@ -60,15 +61,45 @@ stats = {
     "completion_tokens_total": 0,
     "context_length": None,
 }
+# (monotonic time, completion tokens) for the rolling aggregate decode rate.
+_decode_samples = deque()
+DECODE_WINDOW_S = 5.0
 
 def _bump_stats(prompt=0, completion=0):
     if prompt <= 0 and completion <= 0:
         return
+    now = time.monotonic()
     with stats_lock:
         if prompt > 0:
             stats["prompt_tokens_total"] += int(prompt)
         if completion > 0:
-            stats["completion_tokens_total"] += int(completion)
+            n = int(completion)
+            stats["completion_tokens_total"] += n
+            _decode_samples.append((now, n))
+            cutoff = now - DECODE_WINDOW_S
+            while _decode_samples and _decode_samples[0][0] < cutoff:
+                _decode_samples.popleft()
+
+def _decode_tokens_per_sec():
+    """Sum of every in-flight decode over the last DECODE_WINDOW_S seconds."""
+    now = time.monotonic()
+    cutoff = now - DECODE_WINDOW_S
+    with stats_lock:
+        while _decode_samples and _decode_samples[0][0] < cutoff:
+            _decode_samples.popleft()
+        tokens = sum(n for _, n in _decode_samples)
+    return round(tokens / DECODE_WINDOW_S, 2)
+
+@web.middleware
+async def _track_chat_connections(request, handler):
+    if request.path != "/v1/chat/completions":
+        return await handler(request)
+    app = request.app
+    app["chat_connections"] = app.get("chat_connections", 0) + 1
+    try:
+        return await handler(request)
+    finally:
+        app["chat_connections"] -= 1
 
 def _result_new_tokens(r):
     ids = r.get("token_ids") if isinstance(r, dict) else None
@@ -397,7 +428,7 @@ async def generate_full(agen, tokenizer, messages, max_tokens, temperature,
 async def models(request):
     ctx = stats.get("context_length")
     return web.json_response({"object": "list", "data": [{
-        "id": "qwen3.8-27b-exl3-3.5bpw-wm",
+        "id": request.app["model_id"],
         "object": "model",
         "owned_by": "exl3",
         **({"max_model_len": ctx} if ctx else {}),
@@ -422,6 +453,7 @@ async def health(request):
             "unreferenced_pages": pt.num_unreferenced_pages(),
             **{k: int(v) for k, v in pt.metrics.items()},
         }
+    decode_tps = _decode_tokens_per_sec()
     with stats_lock:
         body = {
             "ok": agen is not None,
@@ -434,12 +466,16 @@ async def health(request):
             "pending_jobs": pending,
             "max_seqs": max_seqs,
             "max_output_tokens": request.app.get("default_max_tokens"),
+            "model": request.app.get("model_id"),
+            "connections": request.app.get("chat_connections", 0),
+            "decode_tokens_per_sec": decode_tps,
+            "decode_window_sec": DECODE_WINDOW_S,
             "cache": cache_info,
         }
     return web.json_response(body)
 
 
-def parse_request(body, default_max_tokens):
+def parse_request(body, default_max_tokens, default_model_id):
     messages = body.get("messages")
     if not messages or not isinstance(messages, list):
         return None, "`messages` (list) is required"
@@ -464,7 +500,7 @@ def parse_request(body, default_max_tokens):
         tool_choice = body.get("tool_choice"),
         stop = stop,
         stream = bool(body.get("stream", False)),
-        model_id = body.get("model", "qwen3.8-27b-exl3-3.5bpw-wm"),
+        model_id = body.get("model") or default_model_id,
     ), None
 
 
@@ -494,7 +530,7 @@ async def chat_completions(request):
             status = 413)
     except Exception:
         return web.json_response({"error": {"message": "invalid JSON"}}, status = 400)
-    req, err = parse_request(body, request.app["default_max_tokens"])
+    req, err = parse_request(body, request.app["default_max_tokens"], request.app["model_id"])
     if err:
         return web.json_response({"error": {"message": err}}, status = 400)
 
@@ -733,12 +769,17 @@ def main():
         if agen is not None:
             await agen.close()
 
-    app = web.Application(client_max_size = args.max_body_mb * 1024 * 1024)
+    app = web.Application(
+        client_max_size = args.max_body_mb * 1024 * 1024,
+        middlewares = [_track_chat_connections],
+    )
+    app["chat_connections"] = 0
     app["tokenizer"] = tokenizer
     app["max_body_mb"] = args.max_body_mb
     app["max_seqs"] = args.max_seqs
     app["max_rq_tokens"] = args.max_rq_tokens
     app["default_max_tokens"] = args.max_output_tokens
+    app["model_id"] = os.path.basename(os.path.abspath(args.model.rstrip("/")))
     app.on_startup.append(start_agen)
     app.on_cleanup.append(stop_agen)
     app.router.add_get("/v1/models", models)

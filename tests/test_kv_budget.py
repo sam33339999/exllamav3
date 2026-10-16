@@ -12,6 +12,7 @@ from exllamav3.cache.budget import (
     GIB,
     cache_bytes_per_token,
     kv_pool_tokens,
+    language_max_position,
     prompt_too_long,
 )
 from exllamav3.cache.nvfp4 import CacheLayer_nvfp4
@@ -91,6 +92,16 @@ def test_nvfp4_minicpm_layer_is_576_bytes_per_token():
     attn = SimpleNamespace(num_kv_heads = 2, head_dim = 256)
     layer = CacheLayer_nvfp4(None, attn, 0, PAGE_SIZE)
     assert layer.storage_size() / PAGE_SIZE == 576
+
+
+def test_language_limit_prefers_text_config():
+    outer = SimpleNamespace(
+        max_position_embeddings = 8192,
+        config_dict = {"text_config": {"max_position_embeddings": 262144}},
+    )
+    assert language_max_position(outer) == 262144
+    plain = SimpleNamespace(max_position_embeddings = 131072, config_dict = {})
+    assert language_max_position(plain) == 131072
 
 
 def test_prompt_limit():

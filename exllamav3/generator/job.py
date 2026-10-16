@@ -3,7 +3,7 @@ import torch
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .generator import Generator
-from ..cache.budget import prompt_too_long
+from ..cache.budget import language_max_position, prompt_too_long
 from ..constants import PAGE_SIZE
 import numpy as np
 from .pagetable import Sequence, tensor_hash_checksum, random_hash
@@ -1041,7 +1041,7 @@ class Job:
 
         # One sequence cannot walk past the model's position table. The pool
         # may be larger; that capacity is shared across jobs.
-        max_pos = getattr(getattr(self.generator.model, "config", None), "max_position_embeddings", None)
+        max_pos = language_max_position(getattr(self.generator.model, "config", None))
         for seq in self.sequences:
             too_long = prompt_too_long(len(seq.input_ids), max_pos)
             assert too_long is None, too_long
